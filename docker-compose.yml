@@ -1,6 +1,10 @@
 services:
   web:
-    build: .
+    build:
+      context: .
+      args:
+        # Use Alibaba Cloud mirror of Docker Hub images to avoid docker.io timeouts.
+        PY_BASE_IMAGE: registry.cn-hangzhou.aliyuncs.com/library/python:3.12-slim
     container_name: english-learning-web
     restart: unless-stopped
     environment:

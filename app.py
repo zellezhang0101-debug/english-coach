@@ -14,6 +14,8 @@ from urllib.parse import quote, urljoin, urlparse
 import tempfile
 import time
 import base64
+import threading
+from threading import Lock
 
 try:
     import requests
@@ -2196,6 +2198,12 @@ LOADING_TEMPLATE = """
   (function(){
     var status = document.getElementById("status");
     var errEl = document.getElementById("err");
+    function start() {
+      // Ensure generation is started even if form submit/popup failed.
+      fetch("/daily-practice/start", { method: "POST" })
+        .then(function(){ /* ignore; polling will reflect actual state */ })
+        .catch(function(){ /* ignore */ });
+    }
     function poll() {
       status.textContent = "正在检查…";
       fetch("/daily-practice/article").then(function(r) {
@@ -2204,7 +2212,19 @@ LOADING_TEMPLATE = """
           window.location.href = "/daily-practice";
           return;
         }
-        status.textContent = "尚未就绪，2 秒后重试";
+        if (r.status === 500) {
+          r.json().then(function(d){
+            status.textContent = "";
+            errEl.style.display = "block";
+            errEl.textContent = (d && d.error) ? d.error : "生成失败，请稍后重试。";
+          }).catch(function(){
+            status.textContent = "";
+            errEl.style.display = "block";
+            errEl.textContent = "生成失败，请稍后重试。";
+          });
+          return;
+        }
+        status.textContent = (r.status === 202) ? "生成中… 2 秒后自动刷新" : "尚未就绪，2 秒后重试";
         setTimeout(poll, 2000);
       }).catch(function(e) {
         status.textContent = "";
@@ -2212,7 +2232,8 @@ LOADING_TEMPLATE = """
         errEl.textContent = "请求失败，请刷新重试";
       });
     }
-    setTimeout(poll, 2000);
+    start();
+    setTimeout(poll, 1200);
   })();
   </script>
 </body>
@@ -2220,9 +2241,91 @@ LOADING_TEMPLATE = """
 """
 
 
+_DAILY_PRACTICE_GEN_LOCK = Lock()
+_DAILY_PRACTICE_GEN = {}  # key -> {"state": "running"|"done", "error": str, "started_at": float}
+
+
+def _daily_practice_gen_state(key: str) -> dict:
+    with _DAILY_PRACTICE_GEN_LOCK:
+        return dict(_DAILY_PRACTICE_GEN.get(key) or {})
+
+
+def _ensure_daily_practice_generation(difficulty: str, provider: str, topic: str = "") -> str:
+    """确保当日当难度的练习生成线程已启动（用于 loading 页兜底启动）。"""
+    diff = (difficulty or "C1").strip().upper()
+    if diff not in ("B1", "B2", "C1"):
+        diff = "C1"
+    today = _today_date()
+    key = f"{today}|{diff}"
+
+    # If already generated, nothing to do.
+    dp = _load_daily_practice()
+    if key in dp.get("by_key", {}):
+        return key
+
+    # Provider fallback if key missing.
+    p = (provider or "gemini").strip().lower()
+    if p == "deepseek" and not DEEPSEEK_API_KEY:
+        p = "gemini"
+    if p == "gemini" and not GEMINI_API_KEY and DEEPSEEK_API_KEY:
+        p = "deepseek"
+
+    with _DAILY_PRACTICE_GEN_LOCK:
+        st = _DAILY_PRACTICE_GEN.get(key) or {}
+        if st.get("state") == "running":
+            return key
+        _DAILY_PRACTICE_GEN[key] = {"state": "running", "error": "", "started_at": time.time()}
+
+    def _run():
+        try:
+            art = get_daily_practice_article(diff, p, topic_for_fallback=topic or "")
+            if not art:
+                raise RuntimeError("生成失败：未获取到文章内容。")
+        except Exception as e:
+            traceback.print_exc()
+            with _DAILY_PRACTICE_GEN_LOCK:
+                _DAILY_PRACTICE_GEN[key] = {
+                    "state": "done",
+                    "error": str(e) or "生成失败",
+                    "started_at": _DAILY_PRACTICE_GEN.get(key, {}).get("started_at", time.time()),
+                }
+            return
+        with _DAILY_PRACTICE_GEN_LOCK:
+            _DAILY_PRACTICE_GEN[key] = {
+                "state": "done",
+                "error": "",
+                "started_at": _DAILY_PRACTICE_GEN.get(key, {}).get("started_at", time.time()),
+            }
+
+    threading.Thread(target=_run, daemon=True).start()
+    return key
+
+
+@app.route("/daily-practice/start", methods=["POST"])
+def daily_practice_start():
+    """启动当日练习生成（幂等）。用于 loading 页兜底启动，避免跨窗口提交失败导致一直 404。"""
+    try:
+        payload = request.get_json(silent=True) or {}
+        topic = (payload.get("topic") or "").strip()
+    except Exception:
+        topic = ""
+    key = _ensure_daily_practice_generation(_current_difficulty(), _current_provider(), topic=topic)
+    st = _daily_practice_gen_state(key)
+    if st.get("state") == "done" and st.get("error"):
+        return jsonify({"status": "failed", "error": st.get("error")}), 500
+    if st.get("state") == "done":
+        return jsonify({"status": "done"}), 200
+    return jsonify({"status": "generating"}), 202
+
+
 @app.route("/daily-practice/loading")
 def daily_practice_loading():
     """加载页：点击获取今日练习后立即显示，等待 POST 响应。"""
+    # In production, pop-up or cross-window form submit may fail; ensure generation is started here too.
+    try:
+        _ensure_daily_practice_generation(_current_difficulty(), _current_provider(), topic="")
+    except Exception:
+        traceback.print_exc()
     return LOADING_TEMPLATE
 
 
@@ -2236,6 +2339,11 @@ def daily_practice_article_api():
     key = f"{today}|{difficulty}"
     data = _load_daily_practice()
     if key not in data.get("by_key", {}):
+        st = _daily_practice_gen_state(key)
+        if st.get("state") == "running":
+            return jsonify({"status": "generating"}), 202
+        if st.get("state") == "done" and st.get("error"):
+            return jsonify({"error": st.get("error")}), 500
         return jsonify({"error": "今日暂无练习"}), 404
     article = data["by_key"][key]
     article_html = _strip_script_tags(article.get("article_html", ""))

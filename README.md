@@ -102,6 +102,9 @@ docker compose up -d --build
 http://服务器IP:8000
 ```
 
+> 如果你在阿里云（国内）遇到 Docker Hub（`docker.io`）拉镜像超时/失败，本项目已默认在 `docker-compose.yml` 中使用
+> `registry.cn-hangzhou.aliyuncs.com/library/python:3.12-slim` 作为基础镜像源，通常更稳定。
+
 ### 5.3 数据持久化
 
 应用会把 `vocab_book.json`、`daily_practice.json` 等数据写到容器的 `/data`（由 compose 的 `app_data` volume 持久化）。
