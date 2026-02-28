@@ -116,6 +116,70 @@ cd "/Users/zelle01.zhang/English learning"
 docker compose up -d --build
 ```
 
+### 5.5 减少“获取今日练习”等待时间：每天凌晨预热（推荐）
+
+“今日练习/今日阅读”优先从 `reading_recommendations.json` 的**今日缓存池**里取文章；如果今日池为空或难度不匹配，就会触发实时生成（用户会等待）。
+
+推荐做法：每天凌晨在服务器上跑一次预热脚本，提前：
+- 扩充今日缓存池（默认目标 `DAILY_POOL_TARGET_TOTAL=12`，每难度至少 `DAILY_POOL_MIN_PER_DIFF=2`）
+- 预生成 B1/B2/C1 的“今日练习”文章缓存（写入 `daily_practice.json`）
+
+在服务器上（假设项目目录是 `/home/ecs-user/english-coach`）：
+
+1）确认脚本存在：
+
+```bash
+ls -l /home/ecs-user/english-coach/prewarm_daily.py
+```
+
+2）创建 `systemd` 单次任务：
+
+```bash
+sudo tee /etc/systemd/system/english-coach-prewarm.service >/dev/null <<'EOF'
+[Unit]
+Description=English Coach daily prewarm (pool + daily practice)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/ecs-user/english-coach
+EnvironmentFile=/home/ecs-user/english-coach/.env
+ExecStart=/home/ecs-user/english-coach/.venv/bin/python3 /home/ecs-user/english-coach/prewarm_daily.py
+EOF
+```
+
+3）创建每天凌晨 00:05 执行的定时器（按你的系统时区调整；阿里云常见是 Asia/Shanghai）：
+
+```bash
+sudo tee /etc/systemd/system/english-coach-prewarm.timer >/dev/null <<'EOF'
+[Unit]
+Description=Run English Coach prewarm daily
+
+[Timer]
+OnCalendar=*-*-* 00:05:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+```
+
+4）启用并立刻手动跑一次验证：
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now english-coach-prewarm.timer
+
+sudo systemctl start english-coach-prewarm.service
+sudo journalctl -u english-coach-prewarm -n 200 --no-pager
+```
+
+可用环境变量调优：
+- `DAILY_POOL_TARGET_TOTAL`：今日池目标总数（默认 12）
+- `DAILY_POOL_MIN_PER_DIFF`：每个难度最低数量（默认 2）
+- `DAILY_POOL_MAX_ATTEMPTS`：最多尝试抓取/标注次数（默认 36）
+
 ---
 
 ## 6. 部署到云平台（Render / Fly.io / 阿里云）

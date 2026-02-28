@@ -57,6 +57,9 @@ ARTICLE_HISTORY_PATH = os.path.join(DATA_DIR, "article_history.json")
 RECOMMEND_DATA_PATH = os.path.join(DATA_DIR, "reading_recommendations.json")
 DAILY_PRACTICE_PATH = os.path.join(DATA_DIR, "daily_practice.json")
 DAILY_PRACTICE_GEN_LOCK_TTL_SECONDS = int(os.getenv("DAILY_PRACTICE_GEN_LOCK_TTL_SECONDS") or str(20 * 60))
+DAILY_POOL_TARGET_TOTAL = int(os.getenv("DAILY_POOL_TARGET_TOTAL") or "12")
+DAILY_POOL_MIN_PER_DIFF = int(os.getenv("DAILY_POOL_MIN_PER_DIFF") or "2")
+DAILY_POOL_MAX_ATTEMPTS = int(os.getenv("DAILY_POOL_MAX_ATTEMPTS") or "36")
 
 TZ_BEIJING = timezone(timedelta(hours=8))
 
@@ -1626,37 +1629,78 @@ def _add_one_article(source: str, crawler, used: list, provider: str, articles: 
 
 
 def _pool_has_enough_per_difficulty(data: dict) -> bool:
-    """爬取库中若每个难度(B1/B2/C1)的文章都大于1篇则返回 True，当日可不爬取。"""
+    """今日池是否足够：每个难度(B1/B2/C1)至少有 N 篇，且总数达到目标。
+
+    注意：这是「今日缓存池」是否足够，而不是历史累计是否足够。
+    """
+    today = _today_date()
     daily = data.get("daily") or {}
     count = {"B1": 0, "B2": 0, "C1": 0}
-    for date_articles in daily.values():
-        if not isinstance(date_articles, list):
+    today_articles = daily.get(today, [])
+    if not isinstance(today_articles, list):
+        today_articles = []
+    for a in today_articles:
+        if not isinstance(a, dict):
             continue
-        for a in date_articles:
-            if not isinstance(a, dict):
-                continue
-            d = (a.get("difficulty") or "").strip().upper()
-            if d in count:
-                count[d] += 1
-    return count["B1"] > 1 and count["B2"] > 1 and count["C1"] > 1
+        d = (a.get("difficulty") or "").strip().upper()
+        if d in count:
+            count[d] += 1
+    return (
+        len(today_articles) >= max(3, DAILY_POOL_TARGET_TOTAL)
+        and count["B1"] >= DAILY_POOL_MIN_PER_DIFF
+        and count["B2"] >= DAILY_POOL_MIN_PER_DIFF
+        and count["C1"] >= DAILY_POOL_MIN_PER_DIFF
+    )
 
 
 def _crawl_daily_pool(provider: str = "gemini"):
-    """爬取 3 篇文章并缓存到 daily 池，不写入历史。供每日 0 点定时任务调用。"""
+    """爬取并扩充今日缓存池（不写入历史）。
+
+    为减少“获取今日练习/阅读”的等待时间，今日池会尽量扩充到：
+    - 总数 >= DAILY_POOL_TARGET_TOTAL
+    - 每个难度(B1/B2/C1) >= DAILY_POOL_MIN_PER_DIFF
+    """
     today = _today_date()
     data = _load_recommend_data()
     data.setdefault("used_urls", [])
     data.setdefault("daily", {})
-    # 若每个难度已有 >1 篇，则当日不爬取，节省调用
-    if _pool_has_enough_per_difficulty(data):
-        return data["daily"].get(today, [])
     used = list(data["used_urls"])
-    if today in data["daily"] and len(data["daily"][today]) >= 3:
-        return data["daily"][today]
-    articles = []
-    _add_one_article("21voa", _crawl_21voa_one, used, provider, articles)
-    _add_one_article("i21st", _crawl_i21st_one, used, provider, articles)
-    _add_one_article("buzzing", _crawl_buzzing_one, used, provider, articles)
+    existing = data["daily"].get(today, [])
+    articles = list(existing) if isinstance(existing, list) else []
+
+    def _counts(items):
+        c = {"B1": 0, "B2": 0, "C1": 0}
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            d = (it.get("difficulty") or "").strip().upper()
+            if d in c:
+                c[d] += 1
+        return c
+
+    def _enough(items):
+        c = _counts(items)
+        return (
+            len(items) >= max(3, DAILY_POOL_TARGET_TOTAL)
+            and c["B1"] >= DAILY_POOL_MIN_PER_DIFF
+            and c["B2"] >= DAILY_POOL_MIN_PER_DIFF
+            and c["C1"] >= DAILY_POOL_MIN_PER_DIFF
+        )
+
+    if not _enough(articles):
+        crawlers = [
+            ("21voa", _crawl_21voa_one),
+            ("i21st", _crawl_i21st_one),
+            ("buzzing", _crawl_buzzing_one),
+        ]
+        attempts = 0
+        idx = 0
+        while attempts < max(6, DAILY_POOL_MAX_ATTEMPTS) and not _enough(articles):
+            source, crawler = crawlers[idx % len(crawlers)]
+            idx += 1
+            attempts += 1
+            _add_one_article(source, crawler, used, provider, articles)
+
     data["used_urls"] = used
     data["daily"][today] = articles
     _save_recommend_data(data)
