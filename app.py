@@ -56,6 +56,7 @@ VOCAB_BOOK_PATH = os.path.join(DATA_DIR, "vocab_book.json")
 ARTICLE_HISTORY_PATH = os.path.join(DATA_DIR, "article_history.json")
 RECOMMEND_DATA_PATH = os.path.join(DATA_DIR, "reading_recommendations.json")
 DAILY_PRACTICE_PATH = os.path.join(DATA_DIR, "daily_practice.json")
+DAILY_PRACTICE_GEN_LOCK_TTL_SECONDS = int(os.getenv("DAILY_PRACTICE_GEN_LOCK_TTL_SECONDS") or str(20 * 60))
 
 TZ_BEIJING = timezone(timedelta(hours=8))
 
@@ -2245,13 +2246,91 @@ _DAILY_PRACTICE_GEN_LOCK = Lock()
 _DAILY_PRACTICE_GEN = {}  # key -> {"state": "running"|"done", "error": str, "started_at": float}
 
 
+def _dp_key_slug(key: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", (key or "").strip()) or "unknown"
+
+
+def _dp_gen_paths(key: str):
+    slug = _dp_key_slug(key)
+    lock_path = os.path.join(DATA_DIR, f"daily_practice_gen_{slug}.lock")
+    state_path = os.path.join(DATA_DIR, f"daily_practice_gen_{slug}.state.json")
+    return lock_path, state_path
+
+
+def _load_dp_gen_state_file(state_path: str) -> dict:
+    try:
+        with open(state_path, "r", encoding="utf-8") as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        traceback.print_exc()
+        return {}
+
+
+def _save_dp_gen_state_file(state_path: str, state: dict) -> None:
+    if not isinstance(state, dict):
+        state = {}
+    state.setdefault("updated_at", time.time())
+    tmp_path = state_path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, state_path)
+
+
+def _acquire_lockfile(lock_path: str, ttl_seconds: int) -> bool:
+    try:
+        st = os.stat(lock_path)
+        if time.time() - float(st.st_mtime) > float(ttl_seconds):
+            try:
+                os.remove(lock_path)
+            except Exception:
+                pass
+    except FileNotFoundError:
+        pass
+    except Exception:
+        traceback.print_exc()
+    try:
+        fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        try:
+            os.write(fd, str(time.time()).encode("utf-8"))
+        finally:
+            os.close(fd)
+        return True
+    except FileExistsError:
+        return False
+    except Exception:
+        traceback.print_exc()
+        return False
+
+
+def _release_lockfile(lock_path: str) -> None:
+    try:
+        os.remove(lock_path)
+    except FileNotFoundError:
+        return
+    except Exception:
+        traceback.print_exc()
+
+
 def _daily_practice_gen_state(key: str) -> dict:
+    lock_path, state_path = _dp_gen_paths(key)
+    st_file = _load_dp_gen_state_file(state_path)
+    if st_file:
+        # Normalize minimal fields
+        st_file.setdefault("state", "")
+        st_file.setdefault("error", "")
+        return dict(st_file)
     with _DAILY_PRACTICE_GEN_LOCK:
         return dict(_DAILY_PRACTICE_GEN.get(key) or {})
 
 
 def _ensure_daily_practice_generation(difficulty: str, provider: str, topic: str = "") -> str:
-    """确保当日当难度的练习生成线程已启动（用于 loading 页兜底启动）。"""
+    """确保当日当难度的练习生成已启动。
+
+    生产环境（gunicorn 多 worker）下使用文件锁/状态文件，避免内存状态不共享导致轮询一直 404。
+    """
     diff = (difficulty or "C1").strip().upper()
     if diff not in ("B1", "B2", "C1"):
         diff = "C1"
@@ -2270,11 +2349,34 @@ def _ensure_daily_practice_generation(difficulty: str, provider: str, topic: str
     if p == "gemini" and not GEMINI_API_KEY and DEEPSEEK_API_KEY:
         p = "deepseek"
 
+    lock_path, state_path = _dp_gen_paths(key)
+    st_file = _load_dp_gen_state_file(state_path)
+    if st_file.get("state") == "running":
+        return key
+    # If last run failed very recently, avoid tight retry loops.
+    if st_file.get("state") == "done" and (st_file.get("error") or "").strip():
+        try:
+            updated_at = float(st_file.get("updated_at") or 0)
+        except Exception:
+            updated_at = 0.0
+        if updated_at and (time.time() - updated_at) < 15:
+            return key
+
+    # Cross-worker: try to acquire a lockfile for this key.
+    if not _acquire_lockfile(lock_path, ttl_seconds=DAILY_PRACTICE_GEN_LOCK_TTL_SECONDS):
+        return key
+
     with _DAILY_PRACTICE_GEN_LOCK:
         st = _DAILY_PRACTICE_GEN.get(key) or {}
         if st.get("state") == "running":
+            _release_lockfile(lock_path)
             return key
         _DAILY_PRACTICE_GEN[key] = {"state": "running", "error": "", "started_at": time.time()}
+
+    try:
+        _save_dp_gen_state_file(state_path, {"state": "running", "error": "", "started_at": time.time()})
+    except Exception:
+        traceback.print_exc()
 
     def _run():
         try:
@@ -2289,6 +2391,18 @@ def _ensure_daily_practice_generation(difficulty: str, provider: str, topic: str
                     "error": str(e) or "生成失败",
                     "started_at": _DAILY_PRACTICE_GEN.get(key, {}).get("started_at", time.time()),
                 }
+            try:
+                _save_dp_gen_state_file(
+                    state_path,
+                    {
+                        "state": "done",
+                        "error": str(e) or "生成失败",
+                        "started_at": _DAILY_PRACTICE_GEN.get(key, {}).get("started_at", time.time()),
+                    },
+                )
+            except Exception:
+                traceback.print_exc()
+            _release_lockfile(lock_path)
             return
         with _DAILY_PRACTICE_GEN_LOCK:
             _DAILY_PRACTICE_GEN[key] = {
@@ -2296,6 +2410,18 @@ def _ensure_daily_practice_generation(difficulty: str, provider: str, topic: str
                 "error": "",
                 "started_at": _DAILY_PRACTICE_GEN.get(key, {}).get("started_at", time.time()),
             }
+        try:
+            _save_dp_gen_state_file(
+                state_path,
+                {
+                    "state": "done",
+                    "error": "",
+                    "started_at": _DAILY_PRACTICE_GEN.get(key, {}).get("started_at", time.time()),
+                },
+            )
+        except Exception:
+            traceback.print_exc()
+        _release_lockfile(lock_path)
 
     threading.Thread(target=_run, daemon=True).start()
     return key
@@ -2338,6 +2464,13 @@ def daily_practice_article_api():
     today = _today_date()
     key = f"{today}|{difficulty}"
     data = _load_daily_practice()
+    if key not in data.get("by_key", {}):
+        # Auto-trigger generation here as well (important for prod multi-worker).
+        try:
+            _ensure_daily_practice_generation(difficulty, _current_provider(), topic="")
+        except Exception:
+            traceback.print_exc()
+        data = _load_daily_practice()
     if key not in data.get("by_key", {}):
         st = _daily_practice_gen_state(key)
         if st.get("state") == "running":
