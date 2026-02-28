@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+
+# Local env (never commit)
+.env
+
+# Local data files (persist via DATA_DIR/volume in production)
+vocab_book.json
+article_history.json
+daily_practice.json
+reading_recommendations.json
+

@@ -1,0 +1,23 @@
+services:
+  web:
+    build: .
+    container_name: english-learning-web
+    restart: unless-stopped
+    environment:
+      # Persist JSON data files under /data (mounted volume).
+      DATA_DIR: /data
+      # Required in production (set in .env file).
+      FLASK_SECRET_KEY: ${FLASK_SECRET_KEY}
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY}
+      # Optional fallback:
+      MING_UNIAUDIO_URL: ${MING_UNIAUDIO_URL}
+      MING_UNIAUDIO_TIMEOUT: ${MING_UNIAUDIO_TIMEOUT:-90}
+    volumes:
+      - app_data:/data
+    ports:
+      - "8000:8000"
+
+volumes:
+  app_data:
+

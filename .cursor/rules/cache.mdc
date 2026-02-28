@@ -1,0 +1,14 @@
+---
+description: 删除缓存时自动执行
+alwaysApply: true
+---
+
+# 缓存删除
+
+当用户要求删除缓存时，直接执行删除命令，无需再确认。
+
+缓存文件路径：
+- `daily_practice.json` - 每日练习缓存
+- `reading_recommendations.json` - 阅读推荐缓存
+
+删除命令：`rm -f daily_practice.json reading_recommendations.json`
